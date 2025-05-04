@@ -1,195 +1,315 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+import geopandas as gpd
 import rasterio
+from rasterio.warp import transform_bounds
 import os
 import shutil
 import tempfile
 import base64
+from typing import List
+import zipfile
+import logging
 import numpy as np
 from PIL import Image
 import io
-import logging
-import pyproj
+import json
 
 # إعداد التسجيل
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
 # إعداد CORS
+logger.info("Step: Applying CORS middleware")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"]
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# دالة لتحويل المصفوفة إلى Base64
-def array_to_base64(arr, is_rgb=False):
-    logger.info(f"Array shape before processing: {arr.shape}")
+# مجلد مؤقت للملفات المرفوعة
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+def extract_zip(zip_file: UploadFile, temp_dir: str) -> List[str]:
+    """استخراج ملف ZIP إلى مجلد مؤقت وإرجاع قائمة الملفات."""
+    logger.info(f"Step: Extracting ZIP file: {zip_file.filename}")
+    zip_path = os.path.join(temp_dir, zip_file.filename)
+    with open(zip_path, "wb") as buffer:
+        shutil.copyfileobj(zip_file.file, buffer)
     
-    if is_rgb:
-        if len(arr.shape) != 3 or arr.shape[2] != 3:
-            raise ValueError(f"Expected RGB array with shape (height, width, 3), got {arr.shape}")
-        arr = arr.astype(np.uint8)
-        image = Image.fromarray(arr, mode='RGB')
-    else:
-        if len(arr.shape) != 2:
-            arr = arr.squeeze()
-            logger.info(f"Array shape after squeeze: {arr.shape}")
-            if len(arr.shape) != 2:
-                raise ValueError(f"Cannot convert array with shape {arr.shape} to image.")
-        arr = arr.astype(np.float32)
-        if arr.max() == arr.min():
-            logger.warning("Array has no variation in values, setting to zero.")
-            arr = np.zeros_like(arr)
-        else:
-            arr = (arr - arr.min()) / (arr.max() - arr.min()) * 255
-        arr = arr.astype(np.uint8)
-        image = Image.fromarray(arr)
+    logger.info(f"Step: Verifying ZIP file existence: {zip_path}")
+    if not os.path.exists(zip_path):
+        logger.error(f"Step: ZIP file not saved: {zip_path}")
+        raise ValueError(f"Failed to save ZIP file: {zip_path}")
+    
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(temp_dir)
+    
+    extracted_files = [os.path.join(temp_dir, f) for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f))]
+    logger.info(f"Step: Extracted files: {extracted_files}")
+    return extracted_files
 
-    # تغيير حجم الصورة لتقليل حجم البيانات (اختياري)
-    image = image.resize((500, 500), Image.Resampling.LANCZOS)
-
-    buffered = io.BytesIO()
-    image.save(buffered, format="PNG")
-    return base64.b64encode(buffered.getvalue()).decode('utf-8')
-
-# دالة محسّنة لتخمين نظام الإسقاط
-def guess_crs_from_bounds(bounds):
-    left, bottom, right, top = bounds.left, bounds.bottom, bounds.right, bounds.top
-    logger.info(f"Bounds for CRS guessing: left={left}, bottom={bottom}, right={right}, top={top}")
-
-    # التحقق مما إذا كانت الإحداثيات تبدو وكأنها Lat/Lng
-    if -180 <= left <= 180 and -180 <= right <= 180 and -90 <= bottom <= 90 and -90 <= top <= 90:
-        logger.info("Bounds appear to be in Lat/Lng (EPSG:4326).")
-        return "EPSG:4326"
-
-    # إذا كانت الإحداثيات كبيرة (مثل قيم UTM بالأمتار)
-    if 0 <= left <= 1_000_000 and 0 <= right <= 1_000_000:
-        # افترض أن الإحداثيات في UTM، لكن ليس لدينا Zone محدد بعد
-        # نحتاج إلى تخمين الـ Zone بناءً على تقدير خط الطول (Longitude)
-        # نستخدم Zone 35N مؤقتًا لتحويل الإحداثيات إلى Lat/Lng
+def check_file_details(file_path: str) -> tuple:
+    """التحقق من وجود الملف وحجمه وإمكانية فتحه."""
+    logger.info(f"Step: Checking file details for: {file_path}")
+    if os.path.exists(file_path):
+        size = os.path.getsize(file_path)
+        logger.info(f"Step: File {file_path} exists, size: {size} bytes")
         try:
-            # نستخدم Zone 35N كقاعدة أساسية لتحويل الإحداثيات
-            utm_to_latlon = pyproj.Transformer.from_crs("EPSG:32635", "EPSG:4326", always_xy=True)
-            avg_x = (left + right) / 2
-            avg_y = (bottom + top) / 2
-            lon, lat = utm_to_latlon.transform(avg_x, avg_y)
-
-            # التحقق من صحة الإحداثيات الناتجة
-            if not (-180 <= lon <= 180 and -90 <= lat <= 90):
-                logger.warning("Invalid Lat/Lng coordinates after transformation. Trying a different approach...")
-                # إذا فشل التحويل، نستخدم طريقة تقدير مبسطة
-                # تقدير خط الطول بناءً على قيم easting (افتراض false easting 500000 في UTM)
-                approx_lon = ((avg_x - 500000) / 111320)  # 111320 متر لكل درجة تقريبًا
-                zone = int((approx_lon + 180) / 6) + 1
-            else:
-                # استخدام خط الطول المحسوب لتحديد الـ Zone
-                zone = int((lon + 180) / 6) + 1
-
-            # تحديد نصف الكرة الأرضية
-            if lat >= 0:
-                crs_code = f"EPSG:326{zone:02d}"  # UTM شمالي
-            else:
-                crs_code = f"EPSG:327{zone:02d}"  # UTM جنوبي
-            logger.info(f"Calculated UTM zone: {zone}, CRS: {crs_code}")
-            return crs_code
+            with open(file_path, 'rb') as f:
+                f.read(1)  # محاولة قراءة بايت واحد للتحقق من الوصول
+            logger.info(f"Step: File {file_path} can be opened")
+            return True, size
         except Exception as e:
-            logger.warning(f"Error guessing UTM zone: {str(e)}. Falling back to default.")
-            return "EPSG:32635"
+            logger.error(f"Step: Failed to open file {file_path}: {str(e)}")
+            return False, 0
     else:
-        logger.warning("Bounds do not match UTM or Lat/Lng. Assuming EPSG:32635 as fallback.")
-        return "EPSG:32635"
+        logger.error(f"Step: File {file_path} does not exist")
+        return False, 0
+
+def check_shapefile_components(shp_file: str, temp_dir: str) -> dict:
+    """التحقق من وجود ملفات .shx و.dbf المطلوبة لملف .shp، مع جعل .prj اختياريًا."""
+    logger.info(f"Step: Checking Shapefile components for: {shp_file}")
+    shp_base = os.path.splitext(os.path.basename(shp_file))[0]
+    shx_file = os.path.join(temp_dir, f"{shp_base}.shx")
+    shx_file_upper = os.path.join(temp_dir, f"{shp_base}.SHX")
+    dbf_file = os.path.join(temp_dir, f"{shp_base}.dbf")
+    prj_file = os.path.join(temp_dir, f"{shp_base}.prj")
+    
+    shx_exists, shx_size = check_file_details(shx_file)
+    shx_upper_exists, _ = check_file_details(shx_file_upper)
+    dbf_exists, dbf_size = check_file_details(dbf_file)
+    prj_exists, prj_size = check_file_details(prj_file)
+    
+    if not (shx_exists or shx_upper_exists):
+        logger.error("Step: No valid .shx file found")
+        return {
+            "success": False,
+            "name": os.path.basename(shp_file),
+            "error": f"Missing or inaccessible .shx file for {os.path.basename(shp_file)}. Ensure .shx is uploaded."
+        }
+    if not dbf_exists:
+        logger.error("Step: No valid .dbf file found")
+        return {
+            "success": False,
+            "name": os.path.basename(shp_file),
+            "error": f"Missing or inaccessible .dbf file for {os.path.basename(shp_file)}. Ensure .dbf is uploaded."
+        }
+    
+    if not prj_exists:
+        logger.warning(f"Step: No .prj file found for {os.path.basename(shp_file)}. Will assume EPSG:4326 CRS.")
+    
+    logger.info(f"Step: Shapefile components verified: .shx size={shx_size} bytes, .dbf size={dbf_size} bytes, .prj={'present' if prj_exists else 'missing'}")
+    return {
+        "success": True,
+        "shx_file": shx_file if shx_exists else shx_file_upper
+    }
+
+def process_shapefile(shp_file: str, temp_dir: str) -> dict:
+    """معالجة ملفات Shapefile وتحويلها إلى GeoJSON."""
+    logger.info(f"Step: Starting to process Shapefile: {shp_file}")
+    
+    # التحقق من وجود الملفات المطلوبة
+    check_result = check_shapefile_components(shp_file, temp_dir)
+    if not check_result["success"]:
+        return check_result
+    
+    try:
+        # ضبط خيار SHAPE_RESTORE_SHX
+        os.environ['SHAPE_RESTORE_SHX'] = 'YES'
+        logger.info("Step: SHAPE_RESTORE_SHX set to YES")
+        
+        # التحقق من وجود ملف .shp
+        shp_exists, shp_size = check_file_details(shp_file)
+        if not shp_exists:
+            logger.error("Step: .shp file not found or inaccessible")
+            return {
+                "success": False,
+                "name": os.path.basename(shp_file),
+                "error": f"Shapefile {os.path.basename(shp_file)} not found or inaccessible"
+            }
+        
+        # قراءة Shapefile
+        logger.info(f"Step: Reading Shapefile: {shp_file}")
+        gdf = gpd.read_file(shp_file)
+        logger.info(f"Step: Shapefile CRS: {gdf.crs}")
+        
+        # إذا لم يكن هناك CRS، عيّن EPSG:4326
+        if gdf.crs is None:
+            logger.info(f"Step: No CRS defined for {os.path.basename(shp_file)}. Setting CRS to EPSG:4326.")
+            gdf = gdf.set_crs(epsg=4326)
+        
+        # إعادة الإسقاط إلى WGS84 إذا لزم الأمر
+        if gdf.crs != "EPSG:4326":
+            logger.info("Step: Reprojecting to EPSG:4326")
+            gdf = gdf.to_crs(epsg=4326)
+        
+        # تحويل إلى GeoJSON وفحص الصحة
+        geojson = gdf.to_json()
+        try:
+            json.loads(geojson)  # فحص صحة الـ JSON
+            logger.info(f"Step: GeoJSON validated successfully for {os.path.basename(shp_file)}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Step: Invalid GeoJSON for {os.path.basename(shp_file)}: {str(e)}")
+            return {
+                "success": False,
+                "name": os.path.basename(shp_file),
+                "error": f"Invalid GeoJSON format: {str(e)}"
+            }
+        
+        logger.info(f"Step: Shapefile processed successfully: {os.path.basename(shp_file)}")
+        return {
+            "success": True,
+            "name": os.path.basename(shp_file),
+            "type": "vector",
+            "geojson": geojson
+        }
+    except Exception as e:
+        logger.error(f"Step: Failed to process Shapefile {shp_file}: {str(e)}")
+        return {
+            "success": False,
+            "name": os.path.basename(shp_file),
+            "error": str(e)
+        }
+    finally:
+        # إزالة خيار SHAPE_RESTORE_SHX
+        os.environ.pop('SHAPE_RESTORE_SHX', None)
+        logger.info("Step: SHAPE_RESTORE_SHX unset")
+
+def process_raster(raster_file: str) -> dict:
+    """معالجة ملفات Raster (GeoTIFF) وتحويلها إلى base64 PNG مع تحويل الحدود إلى EPSG:4326."""
+    logger.info(f"Step: Processing Raster: {raster_file}")
+    try:
+        with rasterio.open(raster_file) as src:
+            logger.info(f"Number of bands in {raster_file}: {src.count}")
+            # التعامل مع القنوات المتعددة (RGB) أو القناة الواحدة
+            if src.count >= 3:
+                bands = src.read([1, 2, 3])  # قراءة أول 3 قنوات لـ RGB
+                bands = bands.transpose(1, 2, 0)  # تحويل إلى (height, width, channels)
+                arr = bands.astype(np.uint8)
+                image = Image.fromarray(arr, mode='RGB')
+            else:
+                band = src.read(1)  # قراءة القناة الأولى
+                if len(band.shape) != 2:
+                    band = band.squeeze()
+                arr = band.astype(np.float32)
+                if arr.max() == arr.min():
+                    arr = np.zeros_like(arr)
+                else:
+                    arr = (arr - arr.min()) / (arr.max() - arr.min()) * 255
+                arr = arr.astype(np.uint8)
+                image = Image.fromarray(arr)
+
+            # تغيير حجم الصورة لتقليل استهلاك الموارد
+            image = image.resize((500, 500), Image.Resampling.LANCZOS)
+            buffered = io.BytesIO()
+            image.save(buffered, format="PNG")
+            img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+            # استخراج الحدود الأصلية
+            bounds = [src.bounds.left, src.bounds.bottom, src.bounds.right, src.bounds.top]
+            logger.info(f"Step: Original bounds for {raster_file}: {bounds}")
+
+            # التحقق من CRS وتحويل الحدود إلى EPSG:4326
+            src_crs = src.crs
+            logger.info(f"Step: Source CRS for {raster_file}: {src_crs}")
+            if src_crs is None:
+                logger.warning(f"Step: No CRS defined for {raster_file}. Assuming EPSG:32610 (UTM Zone 10N).")
+                src_crs = "EPSG:32610"
+            
+            # تحويل الحدود إلى EPSG:4326
+            dst_crs = "EPSG:4326"
+            transformed_bounds = transform_bounds(src_crs, dst_crs, bounds[0], bounds[1], bounds[2], bounds[3])
+            bounds = [[transformed_bounds[1], transformed_bounds[0]], [transformed_bounds[3], transformed_bounds[2]]]
+            logger.info(f"Step: Transformed bounds to EPSG:4326 for {raster_file}: {bounds}")
+
+            logger.info(f"Step: Raster processed successfully: {os.path.basename(raster_file)}")
+            return {
+                "success": True,
+                "name": os.path.basename(raster_file),
+                "type": "raster",
+                "data": img_str,
+                "bounds": bounds
+            }
+    except Exception as e:
+        logger.error(f"Step: Error processing Raster {raster_file}: {str(e)}")
+        return {
+            "success": False,
+            "name": os.path.basename(raster_file),
+            "error": str(e)
+        }
 
 @app.post("/upload")
-async def upload_files(files: list[UploadFile] = File(...)):
+async def upload_files(files: List[UploadFile] = File(...)):
+    logger.info(f"Step: Received upload request with {len(files)} files")
     results = []
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        for file in files:
-            file_name = file.filename
-            file_path = os.path.join(temp_dir, file_name)
-
-            logger.info(f"Saving temporary file: {file_path}")
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-
-            try:
-                if file_name.lower().endswith(('.tif', '.tiff')):
-                    logger.info(f"Processing TIFF: {file_name}")
-                    with rasterio.open(file_path) as dataset:
-                        logger.info(f"Number of bands in {file_name}: {dataset.count}")
-                        logger.info(f"Width: {dataset.width}, Height: {dataset.height}")
-                        logger.info(f"Metadata: {dataset.meta}")
-
-                        # قراءة البيانات
-                        if dataset.count >= 3:
-                            if dataset.count >= 4 and "L1TP" in file_name:
-                                bands = dataset.read([4, 3, 2])
-                                logger.info(f"RGB bands shape (Landsat): {bands.shape}")
-                            else:
-                                bands = dataset.read([1, 2, 3])
-                                logger.info(f"RGB bands shape (Generic): {bands.shape}")
-                            bands = bands.transpose(1, 2, 0)
-                            logger.info(f"RGB bands shape after transpose: {bands.shape}")
-                            base64_data = array_to_base64(bands, is_rgb=True)
-                        else:
-                            band = dataset.read(1)
-                            logger.info(f"Band shape: {band.shape}")
-                            if len(band.shape) != 2:
-                                band = band.squeeze()
-                                logger.info(f"Band shape after squeeze: {band.shape}")
-                                if len(band.shape) != 2:
-                                    raise ValueError(f"Unexpected band shape {band.shape} after squeeze.")
-                            base64_data = array_to_base64(band, is_rgb=False)
-
-                        # استخراج الحدود والنظام الإسقاطي
-                        bounds = dataset.bounds
-                        crs = dataset.crs
-                        logger.info(f"Original Bounds for {file_name}: {[[bounds.bottom, bounds.left], [bounds.top, bounds.right]]}")
-                        logger.info(f"CRS for {file_name}: {crs}")
-
-                        # تحديد نظام الإسقاط (CRS)
-                        crs_str = str(crs).upper() if crs else None
-                        if not crs_str or not crs_str.startswith('EPSG:'):
-                            logger.warning(f"No valid CRS found for {file_name}. Attempting to guess CRS...")
-                            crs_str = guess_crs_from_bounds(bounds)
-                            if not crs_str:
-                                logger.warning(f"Could not guess CRS for {file_name}. Assuming EPSG:32635 (UTM Zone 35N).")
-                                crs_str = "EPSG:32635"
-                            else:
-                                logger.info(f"Guessed CRS for {file_name}: {crs_str}")
-
-                        results.append({
-                            "success": True,
-                            "name": file_name,
-                            "type": "raster",
-                            "data": base64_data,
-                            "bounds": [[bounds.bottom, bounds.left], [bounds.top, bounds.right]],
-                            "crs": crs_str
-                        })
-
-                else:
-                    results.append({
-                        "success": False,
-                        "name": file_name,
-                        "error": "نوع ملف غير مدعوم."
-                    })
-
-            except Exception as e:
-                logger.error(f"Error processing {file_name}: {str(e)}")
+    with tempfile.TemporaryDirectory(dir=UPLOAD_DIR) as temp_dir:
+        # الخطوة 1: جمع أسماء الملفات المرفوعة
+        uploaded_filenames = [file.filename.lower() for file in files]
+        logger.info(f"Step: Uploaded filenames: {uploaded_filenames}")
+        
+        # الخطوة 2: التحقق من مكونات كل ملف .shp
+        shp_files = [f for f in uploaded_filenames if f.endswith('.shp')]
+        for shp_filename in shp_files:
+            shp_base = os.path.splitext(shp_filename)[0]
+            required_extensions = [f"{shp_base}.shx", f"{shp_base}.dbf"]
+            missing_extensions = [ext for ext in required_extensions if ext not in uploaded_filenames]
+            if missing_extensions:
+                logger.error(f"Step: Missing required Shapefile components for {shp_filename}: {missing_extensions}")
                 results.append({
                     "success": False,
-                    "name": file_name,
-                    "error": f"خطأ في معالجة {file_name}: {str(e)}"
+                    "name": shp_filename,
+                    "error": f"Missing required Shapefile components: {missing_extensions}"
                 })
-
-    return JSONResponse(content=results)
+                return JSONResponse(content=results)
+        
+        # الخطوة 3: حفظ جميع الملفات أولاً
+        saved_files = []
+        for file in files:
+            logger.info(f"Step: Saving file: {file.filename}")
+            file_path = os.path.join(temp_dir, file.filename)
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+            saved_files.append(file_path)
+            check_file_details(file_path)
+        
+        logger.info(f"Step: All files saved in temp_dir: {saved_files}")
+        
+        # الخطوة 4: معالجة الملفات بعد الحفظ
+        for file in files:
+            logger.info(f"Step: Processing file: {file.filename}")
+            file_path = os.path.join(temp_dir, file.filename)
+            
+            if file.filename.lower().endswith('.zip'):
+                # استخراج ملف ZIP
+                extracted_files = extract_zip(file, temp_dir)
+                shp_extracted_files = [f for f in extracted_files if f.lower().endswith('.shp')]
+                for shp_file in shp_extracted_files:
+                    results.append(process_shapefile(shp_file, temp_dir))
+            elif file.filename.lower().endswith('.shp'):
+                # معالجة ملفات Shapefile
+                results.append(process_shapefile(file_path, temp_dir))
+            elif file.filename.lower().endswith(('.tif', '.tiff')):
+                # معالجة ملفات Raster
+                results.append(process_raster(file_path))
+            else:
+                logger.info(f"Step: Skipping file (not processed): {file.filename}")
+                continue
+    
+    logger.info(f"Step: Returning response: {results}")
+    response = JSONResponse(content=results)
+    response.headers["Access-Control-Allow-Origin"] = "http://localhost:3000"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    logger.info(f"Step: Response headers: {response.headers}")
+    return response
 
 if __name__ == "__main__":
+    logger.info("Step: Starting Uvicorn server")
     import uvicorn
-    uvicorn.run(app, host="localhost", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
