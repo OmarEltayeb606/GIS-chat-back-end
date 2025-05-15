@@ -241,6 +241,47 @@ def process_raster(raster_file: str) -> dict:
             "error": str(e)
         }
 
+def convert_tiff_to_png(tiff_file: str) -> dict:
+    """تحويل ملف TIFF إلى PNG وإرجاعه كـ base64."""
+    logger.info(f"Step: Converting TIFF to PNG: {tiff_file}")
+    try:
+        with rasterio.open(tiff_file) as src:
+            logger.info(f"Number of bands in {tiff_file}: {src.count}")
+            if src.count >= 3:
+                bands = src.read([1, 2, 3])
+                bands = bands.transpose(1, 2, 0)
+                arr = bands.astype(np.uint8)
+                image = Image.fromarray(arr, mode='RGB')
+            else:
+                band = src.read(1)
+                if len(band.shape) != 2:
+                    band = band.squeeze()
+                arr = band.astype(np.float32)
+                if arr.max() == arr.min():
+                    arr = np.zeros_like(arr)
+                else:
+                    arr = (arr - arr.min()) / (arr.max() - arr.min()) * 255
+                arr = arr.astype(np.uint8)
+                image = Image.fromarray(arr)
+
+            buffered = io.BytesIO()
+            image.save(buffered, format="PNG")
+            img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+            logger.info(f"Step: TIFF converted to PNG successfully: {os.path.basename(tiff_file)}")
+            return {
+                "success": True,
+                "name": os.path.basename(tiff_file),
+                "data": img_str
+            }
+    except Exception as e:
+        logger.error(f"Step: Error converting TIFF to PNG {tiff_file}: {str(e)}")
+        return {
+            "success": False,
+            "name": os.path.basename(tiff_file),
+            "error": str(e)
+        }
+
 @app.post("/upload")
 async def upload_files(files: List[UploadFile] = File(...)):
     logger.info(f"Step: Received upload request with {len(files)} files")
@@ -297,6 +338,24 @@ async def upload_files(files: List[UploadFile] = File(...)):
     response.headers["Access-Control-Allow-Credentials"] = "true"
     logger.info(f"Step: Response headers: {response.headers}")
     return response
+
+@app.post("/convert-tiff")
+async def convert_tiff_endpoint(file: UploadFile = File(...)):
+    """نقطة نهاية لتحويل ملف TIFF إلى PNG."""
+    logger.info(f"Step: Received TIFF conversion request for: {file.filename}")
+    if not file.filename.lower().endswith(('.tif', '.tiff')):
+        return JSONResponse(content={
+            "success": False,
+            "name": file.filename,
+            "error": "File must be a TIFF file (.tif or .tiff)"
+        })
+
+    with tempfile.TemporaryDirectory(dir=UPLOAD_DIR) as temp_dir:
+        file_path = os.path.join(temp_dir, file.filename)
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        result = convert_tiff_to_png(file_path)
+        return JSONResponse(content=result)
 
 @app.post("/clip")
 async def clip_vector_endpoint(input_file: UploadFile = File(...), clip_file: UploadFile = File(...)):
