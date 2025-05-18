@@ -17,13 +17,11 @@ import io
 import json
 from tools import clip_vector, save_temp_file, intersect_vectors, buffer_vector, near_features
 
-# إعداد التسجيل
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# إعداد CORS
 logger.info("Step: Applying CORS middleware")
 app.add_middleware(
     CORSMiddleware,
@@ -33,12 +31,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# مجلد مؤقت للملفات المرفوعة
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+# مجلد لحفظ الصور المحولة (اختياري دلوقتي)
+OUTPUT_DIR = "converted_images"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 def extract_zip(zip_file: UploadFile, temp_dir: str) -> List[str]:
-    """استخراج ملف ZIP إلى مجلد مؤقت وإرجاع قائمة الملفات."""
     logger.info(f"Step: Extracting ZIP file: {zip_file.filename}")
     zip_path = os.path.join(temp_dir, zip_file.filename)
     with open(zip_path, "wb") as buffer:
@@ -57,14 +57,13 @@ def extract_zip(zip_file: UploadFile, temp_dir: str) -> List[str]:
     return extracted_files
 
 def check_file_details(file_path: str) -> tuple:
-    """التحقق من وجود الملف وحجمه وإمكانية فتحه."""
     logger.info(f"Step: Checking file details for: {file_path}")
     if os.path.exists(file_path):
         size = os.path.getsize(file_path)
         logger.info(f"Step: File {file_path} exists, size: {size} bytes")
         try:
             with open(file_path, 'rb') as f:
-                f.read(1)  # محاولة قراءة بايت واحد للتحقق من الوصول
+                f.read(1)
             logger.info(f"Step: File {file_path} can be opened")
             return True, size
         except Exception as e:
@@ -75,7 +74,6 @@ def check_file_details(file_path: str) -> tuple:
         return False, 0
 
 def check_shapefile_components(shp_file: str, temp_dir: str) -> dict:
-    """التحقق من وجود ملفات .shx و.dbf المطلوبة لملف .shp، مع جعل .prj اختياريًا."""
     logger.info(f"Step: Checking Shapefile components for: {shp_file}")
     shp_base = os.path.splitext(os.path.basename(shp_file))[0]
     shx_file = os.path.join(temp_dir, f"{shp_base}.shx")
@@ -113,20 +111,16 @@ def check_shapefile_components(shp_file: str, temp_dir: str) -> dict:
     }
 
 def process_shapefile(shp_file: str, temp_dir: str) -> dict:
-    """معالجة ملفات Shapefile وتحويلها إلى GeoJSON."""
     logger.info(f"Step: Starting to process Shapefile: {shp_file}")
     
-    # التحقق من وجود الملفات المطلوبة
     check_result = check_shapefile_components(shp_file, temp_dir)
     if not check_result["success"]:
         return check_result
     
     try:
-        # ضبط خيار SHAPE_RESTORE_SHX
         os.environ['SHAPE_RESTORE_SHX'] = 'YES'
         logger.info("Step: SHAPE_RESTORE_SHX set to YES")
         
-        # التحقق من وجود ملف .shp
         shp_exists, shp_size = check_file_details(shp_file)
         if not shp_exists:
             logger.error("Step: .shp file not found or inaccessible")
@@ -136,25 +130,21 @@ def process_shapefile(shp_file: str, temp_dir: str) -> dict:
                 "error": f"Shapefile {os.path.basename(shp_file)} not found or inaccessible"
             }
         
-        # قراءة Shapefile
         logger.info(f"Step: Reading Shapefile: {shp_file}")
         gdf = gpd.read_file(shp_file)
         logger.info(f"Step: Shapefile CRS: {gdf.crs}")
         
-        # إذا لم يكن هناك CRS، عيّن EPSG:4326
         if gdf.crs is None:
             logger.info(f"Step: No CRS defined for {os.path.basename(shp_file)}. Setting CRS to EPSG:4326.")
             gdf = gdf.set_crs(epsg=4326)
         
-        # إعادة الإسقاط إلى WGS84 إذا لزم الأمر
         if gdf.crs != "EPSG:4326":
             logger.info("Step: Reprojecting to EPSG:4326")
             gdf = gdf.to_crs(epsg=4326)
         
-        # تحويل إلى GeoJSON وفحص الصحة
         geojson = gdf.to_json()
         try:
-            json.loads(geojson)  # فحص صحة الـ JSON
+            json.loads(geojson)
             logger.info(f"Step: GeoJSON validated successfully for {os.path.basename(shp_file)}")
         except json.JSONDecodeError as e:
             logger.error(f"Step: Invalid GeoJSON for {os.path.basename(shp_file)}: {str(e)}")
@@ -179,12 +169,10 @@ def process_shapefile(shp_file: str, temp_dir: str) -> dict:
             "error": str(e)
         }
     finally:
-        # إزالة خيار SHAPE_RESTORE_SHX
         os.environ.pop('SHAPE_RESTORE_SHX', None)
         logger.info("Step: SHAPE_RESTORE_SHX unset")
 
 def process_raster(raster_file: str) -> dict:
-    """معالجة ملفات Raster (GeoTIFF) وتحويلها إلى base64 PNG مع تحويل الحدود إلى EPSG:4326."""
     logger.info(f"Step: Processing Raster: {raster_file}")
     try:
         with rasterio.open(raster_file) as src:
@@ -241,8 +229,52 @@ def process_raster(raster_file: str) -> dict:
             "error": str(e)
         }
 
-def convert_tiff_to_png(tiff_file: str) -> dict:
-    """تحويل ملف TIFF إلى PNG وإرجاعه كـ base64."""
+def convert_image_to_png(file_path: str, filename: str) -> dict:
+    logger.info(f"Step: Converting image to PNG: {file_path}")
+    try:
+        # فتح الصورة باستخدام PIL للتعامل مع JPEG وPNG
+        image = Image.open(file_path)
+        
+        # تحويل الصورة لـ RGB إذا كانت مش بصيغة RGB (مثلًا RGBA أو CMYK)
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+
+        max_dimension = 500
+        img_width, img_height = image.size
+        logger.info(f"Original dimensions of {file_path}: {img_width}x{img_height}")
+        if img_width > max_dimension or img_height > max_dimension:
+            aspect_ratio = img_width / img_height
+            if img_width > img_height:
+                new_width = max_dimension
+                new_height = int(max_dimension / aspect_ratio)
+            else:
+                new_height = max_dimension
+                new_width = int(max_dimension * aspect_ratio)
+            image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            logger.info(f"Resized dimensions of {file_path}: {new_width}x{new_height}")
+        else:
+            logger.info(f"No resize needed for {file_path}: dimensions are within limits")
+
+        buffered = io.BytesIO()
+        image.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+        logger.info(f"Step: Image converted to PNG successfully: {filename}")
+        return {
+            "success": True,
+            "name": filename,
+            "data": img_str,
+            "dimensions": {"width": image.size[0], "height": image.size[1]}
+        }
+    except Exception as e:
+        logger.error(f"Step: Error converting image to PNG {file_path}: {str(e)}")
+        return {
+            "success": False,
+            "name": filename,
+            "error": str(e)
+        }
+
+def convert_tiff_to_png(tiff_file: str, filename: str) -> dict:
     logger.info(f"Step: Converting TIFF to PNG: {tiff_file}")
     try:
         with rasterio.open(tiff_file) as src:
@@ -264,21 +296,38 @@ def convert_tiff_to_png(tiff_file: str) -> dict:
                 arr = arr.astype(np.uint8)
                 image = Image.fromarray(arr)
 
+            max_dimension = 500
+            img_width, img_height = image.size
+            logger.info(f"Original dimensions of {tiff_file}: {img_width}x{img_height}")
+            if img_width > max_dimension or img_height > max_dimension:
+                aspect_ratio = img_width / img_height
+                if img_width > img_height:
+                    new_width = max_dimension
+                    new_height = int(max_dimension / aspect_ratio)
+                else:
+                    new_height = max_dimension
+                    new_width = int(max_dimension * aspect_ratio)
+                image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                logger.info(f"Resized dimensions of {tiff_file}: {new_width}x{new_height}")
+            else:
+                logger.info(f"No resize needed for {tiff_file}: dimensions are within limits")
+
             buffered = io.BytesIO()
             image.save(buffered, format="PNG")
             img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-            logger.info(f"Step: TIFF converted to PNG successfully: {os.path.basename(tiff_file)}")
+            logger.info(f"Step: TIFF converted to PNG successfully: {filename}")
             return {
                 "success": True,
-                "name": os.path.basename(tiff_file),
-                "data": img_str
+                "name": filename,
+                "data": img_str,
+                "dimensions": {"width": image.size[0], "height": image.size[1]}
             }
     except Exception as e:
         logger.error(f"Step: Error converting TIFF to PNG {tiff_file}: {str(e)}")
         return {
             "success": False,
-            "name": os.path.basename(tiff_file),
+            "name": filename,
             "error": str(e)
         }
 
@@ -341,25 +390,28 @@ async def upload_files(files: List[UploadFile] = File(...)):
 
 @app.post("/convert-tiff")
 async def convert_tiff_endpoint(file: UploadFile = File(...)):
-    """نقطة نهاية لتحويل ملف TIFF إلى PNG."""
-    logger.info(f"Step: Received TIFF conversion request for: {file.filename}")
-    if not file.filename.lower().endswith(('.tif', '.tiff')):
+    logger.info(f"Step: Received image conversion request for: {file.filename}")
+    if not (file.filename.lower().endswith(('.tif', '.tiff', '.jpeg', '.jpg', '.png'))):
         return JSONResponse(content={
             "success": False,
             "name": file.filename,
-            "error": "File must be a TIFF file (.tif or .tiff)"
+            "error": "File must be an image (JPEG, PNG, or TIFF)"
         })
 
     with tempfile.TemporaryDirectory(dir=UPLOAD_DIR) as temp_dir:
         file_path = os.path.join(temp_dir, file.filename)
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-        result = convert_tiff_to_png(file_path)
+        
+        if file.filename.lower().endswith(('.tif', '.tiff')):
+            result = convert_tiff_to_png(file_path, file.filename)
+        else:
+            result = convert_image_to_png(file_path, file.filename)
+        
         return JSONResponse(content=result)
 
 @app.post("/clip")
 async def clip_vector_endpoint(input_file: UploadFile = File(...), clip_file: UploadFile = File(...)):
-    """نقطة نهاية لتقطيع طبقة متجهة باستخدام طبقة أخرى."""
     logger.info("Step: Received clip request")
     with tempfile.TemporaryDirectory(dir=UPLOAD_DIR) as temp_dir:
         input_path = save_temp_file(input_file, temp_dir)
@@ -369,10 +421,9 @@ async def clip_vector_endpoint(input_file: UploadFile = File(...), clip_file: Up
 
 @app.post("/intersect")
 async def intersect_endpoint(files: List[UploadFile] = File(...)):
-    """نقطة نهاية لتقاطع متعدد الطبقات."""
     logger.info(f"Step: Received intersect request with {len(files)} files")
     if len(files) < 2:
-        return JSONResponse(content={"success": False, "error": "At least two layers are required."})
+        return JSONResponse(content={"success": false, "error": "At least two layers are required."})
     
     with tempfile.TemporaryDirectory(dir=UPLOAD_DIR) as temp_dir:
         file_paths = [save_temp_file(file, temp_dir) for file in files]
@@ -381,7 +432,6 @@ async def intersect_endpoint(files: List[UploadFile] = File(...)):
 
 @app.post("/buffer")
 async def buffer_endpoint(input_file: UploadFile = File(...), buffer_distance: float = 100, unit: str = "Meters"):
-    """نقطة نهاية لإنشاء منطقة تأثير."""
     logger.info("Step: Received buffer request")
     with tempfile.TemporaryDirectory(dir=UPLOAD_DIR) as temp_dir:
         input_path = save_temp_file(input_file, temp_dir)
@@ -390,7 +440,6 @@ async def buffer_endpoint(input_file: UploadFile = File(...), buffer_distance: f
 
 @app.post("/near")
 async def near_endpoint(input_file: UploadFile = File(...), near_file: UploadFile = File(...), max_distance: float = None, k_neighbors: int = 1):
-    """نقطة نهاية لإيجاد أقرب المعالم."""
     logger.info("Step: Received near request")
     with tempfile.TemporaryDirectory(dir=UPLOAD_DIR) as temp_dir:
         input_path = save_temp_file(input_file, temp_dir)
